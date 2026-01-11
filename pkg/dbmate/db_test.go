@@ -845,3 +845,35 @@ func TestMigrationContents(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+func TestPostgres(t *testing.T) {
+	t.Run("migration with function in a different schema", func(t *testing.T) {
+		u := dbtest.GetenvURLOrSkip(t, "POSTGRES_TEST_URL")
+		db := newTestDB(t, u)
+
+		db.FS = fstest.MapFS{
+			"db/migrations/001_pg_schema_in_function_call.sql": {
+				Data: []byte(
+					"-- migrate:up\r\n" +
+						"create schema dbmate_test_functions;\r\n" +
+						"create function dbmate_test_functions.test_function()\r\n" +
+						"returns timestamptz\r\n" +
+						"language sql\r\n" +
+						"as $$ select now() $$;\r\n" +
+						"select dbmate_test_functions.test_function(); \r\n" +
+						"-- migrate:down\r\n",
+				),
+			},
+		}
+
+		// drop and recreate database
+		err := db.Drop()
+		require.NoError(t, err)
+		err = db.Create()
+		require.NoError(t, err)
+
+		// migrate
+		err = db.Migrate()
+		require.NoError(t, err)
+	})
+}
