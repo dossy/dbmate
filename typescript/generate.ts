@@ -43,7 +43,7 @@ const ARCH_MAP: Record<string, string> = {
 // fetch version number
 async function getVersion(): Promise<string> {
   const versionFile = await readFile("../pkg/dbmate/version.go", "utf8");
-  const matches = versionFile.match(/Version = "([^"]+)"/);
+  const matches = /Version = "([^"]+)"/.exec(versionFile);
 
   if (matches?.[1]) {
     return matches[1];
@@ -64,7 +64,7 @@ async function getBuildMatrix() {
 async function copyTemplate(
   filename: string,
   targetDir: string,
-  vars: Record<string, string>
+  vars: Record<string, string>,
 ) {
   const source = await readFile(`packages/template/${filename}`, "utf8");
   const template = Handlebars.compile(source);
@@ -83,7 +83,7 @@ async function main() {
   // parse main package.json
   const version = await getVersion();
   const mainPackageJson = JSON.parse(
-    await readFile("packages/dbmate/package.json", "utf8")
+    await readFile("packages/dbmate/package.json", "utf8"),
   ) as PackageJson;
   mainPackageJson.version = version;
 
@@ -121,14 +121,14 @@ async function main() {
         // copy os/arch binary (typically built via CI)
         await cp(
           `../dist/dbmate-${build.os}-${build.arch}/dbmate-${build.os}-${build.arch}${binext}`,
-          targetBin
+          targetBin,
         );
       }
       await chmod(targetBin, 0o755);
     } catch (e) {
       console.error(e);
       throw new Error(
-        "Run `npm run generate -- --skip-bin` to test generate without binaries"
+        "Run `npm run generate -- --skip-bin` to test generate without binaries",
       );
     }
 
@@ -144,7 +144,7 @@ async function main() {
   // write package.json
   await writeFile(
     "dist/dbmate/package.json",
-    JSON.stringify(mainPackageJson, undefined, 2)
+    JSON.stringify(mainPackageJson, undefined, 2),
   );
 
   // copy readme and license
@@ -152,7 +152,7 @@ async function main() {
   await cp("../README.md", "dist/dbmate/README.md");
 }
 
-main().catch((e) => {
+main().catch((e: unknown) => {
   console.error(e);
   process.exit(1);
 });

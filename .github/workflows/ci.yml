@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: "*"
+    tags: ["*"]
   pull_request:
 
 jobs:
@@ -26,11 +26,11 @@ jobs:
           - os: linux
             image: ubuntu-latest
             arch: arm
-            setup: sudo apt-get update && sudo apt-get install -qq gcc-arm-linux-gnueabihf
+            setup: sudo apt-get update && sudo apt-get install -qq gcc-arm-linux-gnueabi
             env:
-              CC: arm-linux-gnueabihf-gcc
-              CXX: arm-linux-gnueabihf-g++
-              GOARM: 7
+              CC: arm-linux-gnueabi-gcc
+              CXX: arm-linux-gnueabi-g++
+              GOARM: 6
           - os: linux
             image: ubuntu-latest
             arch: arm64
@@ -49,6 +49,7 @@ jobs:
           - os: windows
             image: windows-latest
             arch: amd64
+            setup: choco install sqlite
             env: {}
 
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
@@ -56,9 +57,9 @@ jobs:
     env: ${{ matrix.env }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -72,17 +73,22 @@ jobs:
           GOARCH: ${{ matrix.arch }}
           OUTPUT: dbmate-${{ matrix.os }}-${{ matrix.arch }}
 
+      - run: make test
+        if: ${{ matrix.arch == 'amd64' }}
+        env:
+          GOARCH: ${{ matrix.arch }}
+
       - run: dist/dbmate-${{ matrix.os }}-${{ matrix.arch }} --help
         if: ${{ matrix.arch == 'amd64' }}
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v6
         with:
           name: dbmate-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/dbmate-*
 
       - name: Publish binaries
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         with:
           files: dist/dbmate-*
@@ -94,52 +100,52 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
       - name: Configure QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
 
       - name: Configure Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
 
       - name: Check Docker environment
         run: |
           set -x
           docker version
           docker buildx version
-          docker-compose version
+          docker compose version
 
       - name: Build Docker image
         run: |
           set -x
-          docker-compose build
-          docker-compose run --rm --no-deps dbmate --version
+          docker compose build
+          docker compose run --rm --no-deps dbmate --version
 
       - name: Run make build
-        run: docker-compose run --rm --no-deps dev make build ls
+        run: docker compose run --rm --no-deps dev make build ls
 
       - name: Run make lint
-        run: docker-compose run --rm --no-deps dev make lint
+        run: docker compose run --rm --no-deps dev make lint
 
       - name: Start test dependencies
         run: |
           set -x
-          docker-compose pull --quiet
-          docker-compose up --detach
-          docker-compose run --rm dev make wait
+          docker compose pull --ignore-buildable --quiet
+          docker compose up --detach
+          docker compose run --rm dev make wait
 
       - name: Run make test
-        run: docker-compose run --rm dev make test
+        run: docker compose run --rm dev make test
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
         with:
           registry: ghcr.io
@@ -148,7 +154,7 @@ jobs:
 
       - name: Generate Docker image tags
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
         with:
           images: |
@@ -161,7 +167,7 @@ jobs:
             type=semver,pattern={{major}}
 
       - name: Publish Docker image
-        uses: docker/build-push-action@v4
+        uses: docker/build-push-action@v6
         if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
         with:
           context: .
@@ -175,18 +181,22 @@ jobs:
     name: NPM
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v3
+      - run: corepack enable
+
+      - uses: actions/setup-node@v6
         with:
-          node-version: 16
-          registry-url: https://registry.npmjs.org
+          node-version: 20
           cache: npm
           cache-dependency-path: typescript/package-lock.json
 
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v7
         with:
           path: dist
 
@@ -201,8 +211,9 @@ jobs:
       - run: npm run generate
         working-directory: typescript
 
+      - run: npm test
+        working-directory: typescript
+
       - run: npm run publish
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         working-directory: typescript
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}

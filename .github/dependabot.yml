@@ -1,5 +1,13 @@
 version: 2
 updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: golang
+        versions: ["*rc*"]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

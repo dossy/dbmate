@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os/exec"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/amacneil/dbmate/v2/pkg/dbmate"
@@ -15,9 +18,58 @@ import (
 	"github.com/lib/pq"
 )
 
+// pgDumpVersion represents a parsed pg_dump version
+type pgDumpVersion struct {
+	major int
+	minor int
+}
+
+// pgDumpVersionRegexp matches pg_dump version output like "pg_dump (PostgreSQL) 17.6 (Debian 17.6-1.pgdg120+1)"
+var pgDumpVersionRegexp = regexp.MustCompile(`\(PostgreSQL\) (\d+)\.(\d+)`)
+
+// getPgDumpVersion returns the version of pg_dump, or nil if it cannot be determined
+func getPgDumpVersion() *pgDumpVersion {
+	cmd := exec.Command("pg_dump", "--version")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	matches := pgDumpVersionRegexp.FindStringSubmatch(string(output))
+	if len(matches) < 3 {
+		return nil
+	}
+
+	major, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return nil
+	}
+
+	minor, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return nil
+	}
+
+	return &pgDumpVersion{major: major, minor: minor}
+}
+
+// supportsRestrictKey returns true if pg_dump supports --restrict-key.
+func (v *pgDumpVersion) supportsRestrictKey() bool {
+	if v == nil {
+		return false
+	}
+	// --restrict-key was added in PostgreSQL 15.14, 16.10, and 17.6
+	return v.major > 17 ||
+		(v.major == 17 && v.minor >= 6) ||
+		(v.major == 16 && v.minor >= 10) ||
+		(v.major == 15 && v.minor >= 14)
+}
+
 func init() {
 	dbmate.RegisterDriver(NewDriver, "postgres")
 	dbmate.RegisterDriver(NewDriver, "postgresql")
+	dbmate.RegisterDriver(NewDriver, "redshift")
+	dbmate.RegisterDriver(NewDriver, "spanner-postgres")
 }
 
 // Driver provides top level database functions
@@ -70,24 +122,35 @@ func connectionString(u *url.URL) string {
 		query.Del("port")
 	}
 	if port == "" {
-		port = "5432"
+		switch u.Scheme {
+		case "redshift":
+			port = "5439"
+		default:
+			port = "5432"
+		}
 	}
 
 	// generate output URL
 	out, _ := url.Parse(u.String())
+	// force scheme back to postgres if there was another postgres-compatible scheme
+	out.Scheme = "postgres"
 	out.Host = fmt.Sprintf("%s:%s", hostname, port)
 	out.RawQuery = query.Encode()
 
 	return out.String()
 }
 
-func connectionArgsForDump(u *url.URL) []string {
-	u = dbutil.MustParseURL(connectionString(u))
+func connectionArgsForDump(conn *url.URL) []string {
+	u, err := url.Parse(connectionString(conn))
+	if err != nil {
+		panic(err)
+	}
 
 	// find schemas from search_path
 	query := u.Query()
 	schemas := strings.Split(query.Get("search_path"), ",")
 	query.Del("search_path")
+	query.Del("binary_parameters")
 	u.RawQuery = query.Encode()
 
 	out := []string{}
@@ -114,8 +177,10 @@ func (drv *Driver) openPostgresDB() (*sql.DB, error) {
 		return nil, err
 	}
 
-	// connect to postgres database
-	postgresURL.Path = "postgres"
+	// connect to postgres database, unless this is a Redshift connection
+	if drv.databaseURL.Scheme != "redshift" {
+		postgresURL.Path = "postgres"
+	}
 
 	return sql.Open("postgres", postgresURL.String())
 }
@@ -183,8 +248,17 @@ func (drv *Driver) schemaMigrationsDump(db *sql.DB) ([]byte, error) {
 // DumpSchema returns the current database schema
 func (drv *Driver) DumpSchema(db *sql.DB) ([]byte, error) {
 	// load schema
-	args := append([]string{"--format=plain", "--encoding=UTF8", "--schema-only",
-		"--no-privileges", "--no-owner"}, connectionArgsForDump(drv.databaseURL)...)
+	args := []string{"--format=plain", "--encoding=UTF8", "--schema-only",
+		"--no-privileges", "--no-owner"}
+
+	// PostgreSQL 15.14+/16.10+/17.6+ adds \restrict/\unrestrict commands to pg_dump output with a random key
+	// by default, making the output non-deterministic. Use a fixed key for reproducible output.
+	// See: https://github.com/amacneil/dbmate/issues/678
+	if version := getPgDumpVersion(); version.supportsRestrictKey() {
+		args = append(args, "--restrict-key=dbmate")
+	}
+
+	args = append(args, connectionArgsForDump(drv.databaseURL)...)
 	schema, err := dbutil.RunCommand("pg_dump", args...)
 	if err != nil {
 		return nil, err
@@ -249,7 +323,7 @@ func (drv *Driver) CreateMigrationsTable(db *sql.DB) error {
 
 	// first attempt at creating migrations table
 	createTableStmt := fmt.Sprintf(
-		"create table if not exists %s.%s (version varchar(128) primary key)",
+		"create table if not exists %s.%s (version varchar primary key)",
 		schema, migrationsTable)
 	_, err = db.Exec(createTableStmt)
 	if err == nil {
@@ -363,6 +437,19 @@ func (drv *Driver) Ping() error {
 	return err
 }
 
+// Return a normalized version of the driver-specific error type.
+func (drv *Driver) QueryError(query string, err error) error {
+	position := 0
+
+	if pqErr, ok := err.(*pq.Error); ok {
+		if pos, err := strconv.Atoi(pqErr.Position); err == nil {
+			position = pos
+		}
+	}
+
+	return &dbmate.QueryError{Err: err, Query: query, Position: position}
+}
+
 func (drv *Driver) quotedMigrationsTableName(db dbutil.Transaction) (string, error) {
 	schema, name, err := drv.quotedMigrationsTableNameParts(db)
 	if err != nil {
@@ -409,6 +496,11 @@ func (drv *Driver) quotedMigrationsTableNameParts(db dbutil.Transaction) (string
 
 	if err != nil {
 		return "", "", err
+	}
+
+	// Quote identifiers for Redshift and Spanner
+	if drv.databaseURL.Scheme == "redshift" || drv.databaseURL.Scheme == "spanner-postgres" {
+		return pq.QuoteIdentifier(schema), pq.QuoteIdentifier(strings.Join(tableNameParts, ".")), nil
 	}
 
 	// quote all parts

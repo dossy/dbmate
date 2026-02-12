@@ -1,9 +1,6 @@
 # enable cgo to build sqlite
 export CGO_ENABLED = 1
 
-# strip binaries
-FLAGS := -tags sqlite_omit_load_extension,sqlite_json -ldflags '-s'
-
 # default output file
 OUTPUT ?= dbmate
 
@@ -11,7 +8,10 @@ OUTPUT ?= dbmate
 GOOS := $(shell go env GOOS)
 ifeq ($(GOOS),linux)
 	# statically link binaries to support alpine linux
-	FLAGS := -tags netgo,osusergo,sqlite_omit_load_extension,sqlite_json  -ldflags '-s -extldflags "-static"'
+	override FLAGS := -tags netgo,osusergo,sqlite_omit_load_extension,sqlite_fts5,sqlite_json -ldflags '-s -extldflags "-static"' $(FLAGS)
+else
+	# strip binaries
+	override FLAGS := -tags sqlite_omit_load_extension,sqlite_fts5,sqlite_json -ldflags '-s' $(FLAGS)
 endif
 ifeq ($(GOOS),darwin)
 	export SDKROOT ?= $(shell xcrun --sdk macosx --show-sdk-path)
@@ -40,15 +40,15 @@ ls:
 
 .PHONY: test
 test:
-	go test -p 1 $(FLAGS) ./...
+	go test -v -p 1 $(FLAGS) ./...
 
 .PHONY: lint
 lint:
-	golangci-lint run --timeout 2m
+	golangci-lint run --timeout 5m
 
 .PHONY: fix
 fix:
-	golangci-lint run --fix
+	golangci-lint run --fix --timeout 5m
 
 .PHONY: wait
 wait:
@@ -56,12 +56,26 @@ wait:
 	dist/dbmate -e MYSQL_TEST_URL wait
 	dist/dbmate -e POSTGRES_TEST_URL wait
 
+.PHONY: update-deps
+update-deps:
+	go get -u ./...
+	go mod tidy
+	go mod verify
+	cd typescript && \
+		rm -f package-lock.json && \
+		./node_modules/.bin/npm-check-updates --upgrade && \
+		npm install && \
+		npm dedupe
+
+.PHONY: docker-build
+docker-build:
+	docker compose pull --ignore-buildable
+	docker compose build dev
+
 .PHONY: docker-all
-docker-all:
-	docker-compose pull
-	docker-compose build
-	docker-compose run --rm dev make all
+docker-all: docker-build
+	docker compose run --rm dev make all
 
 .PHONY: docker-sh
 docker-sh:
-	-docker-compose run --rm dev
+	-docker compose run --rm dev

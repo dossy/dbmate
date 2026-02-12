@@ -2,19 +2,37 @@ package postgres
 
 import (
 	"database/sql"
+	"fmt"
 	"net/url"
-	"os"
 	"runtime"
 	"testing"
 
 	"github.com/amacneil/dbmate/v2/pkg/dbmate"
+	"github.com/amacneil/dbmate/v2/pkg/dbtest"
 	"github.com/amacneil/dbmate/v2/pkg/dbutil"
 
 	"github.com/stretchr/testify/require"
 )
 
 func testPostgresDriver(t *testing.T) *Driver {
-	u := dbutil.MustParseURL(os.Getenv("POSTGRES_TEST_URL"))
+	u := dbtest.GetenvURLOrSkip(t, "POSTGRES_TEST_URL")
+	drv, err := dbmate.New(u).Driver()
+	require.NoError(t, err)
+
+	return drv.(*Driver)
+}
+
+func testRedshiftDriver(t *testing.T) *Driver {
+	u := dbtest.GetenvURLOrSkip(t, "REDSHIFT_TEST_URL")
+	drv, err := dbmate.New(u).Driver()
+	require.NoError(t, err)
+
+	return drv.(*Driver)
+}
+
+func testSpannerPostgresDriver(t *testing.T) *Driver {
+	// URL to the spanner pgadapter, or a locally-running spanner emulator with the pgadapter
+	u := dbtest.GetenvURLOrSkip(t, "SPANNER_POSTGRES_TEST_URL")
 	drv, err := dbmate.New(u).Driver()
 	require.NoError(t, err)
 
@@ -33,14 +51,45 @@ func prepTestPostgresDB(t *testing.T) *sql.DB {
 	require.NoError(t, err)
 
 	// connect database
-	db, err := sql.Open("postgres", drv.databaseURL.String())
+	db, err := sql.Open("postgres", connectionString(drv.databaseURL))
+	require.NoError(t, err)
+
+	return db
+}
+
+func prepRedshiftTestDB(t *testing.T, drv *Driver) *sql.DB {
+	// connect database
+	db, err := sql.Open("postgres", connectionString(drv.databaseURL))
+	require.NoError(t, err)
+
+	_, migrationsTable, err := drv.quotedMigrationsTableNameParts(db)
+	if err != nil {
+		t.Error(err)
+	}
+
+	_, err = db.Exec(fmt.Sprintf("drop table if exists %s", migrationsTable))
+	require.NoError(t, err)
+
+	return db
+}
+
+func prepTestSpannerPostgresDB(t *testing.T, drv *Driver) *sql.DB {
+	// Spanner doesn't allow running `drop database`, so we just drop the migrations
+	// table instead
+	db, err := sql.Open("postgres", connectionString(drv.databaseURL))
+	require.NoError(t, err)
+
+	_, migrationsTable, err := drv.quotedMigrationsTableNameParts(db)
+	require.NoError(t, err)
+
+	_, err = db.Exec(fmt.Sprintf("drop table if exists %s", migrationsTable))
 	require.NoError(t, err)
 
 	return db
 }
 
 func TestGetDriver(t *testing.T) {
-	db := dbmate.New(dbutil.MustParseURL("postgres://"))
+	db := dbmate.New(dbtest.MustParseURL(t, "postgres://"))
 	drvInterface, err := db.Driver()
 	require.NoError(t, err)
 
@@ -49,6 +98,54 @@ func TestGetDriver(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, db.DatabaseURL.String(), drv.databaseURL.String())
 	require.Equal(t, "schema_migrations", drv.migrationsTableName)
+}
+
+func TestPgDumpVersionRegexp(t *testing.T) {
+	cases := []struct {
+		input         string
+		expectedMajor int
+		expectedMinor int
+	}{
+		{"pg_dump (PostgreSQL) 17.6 (Debian 17.6-1.pgdg120+1)", 17, 6},
+		{"pg_dump (PostgreSQL) 16.0", 16, 0},
+		{"pg_dump (PostgreSQL) 15.12", 15, 12},
+	}
+
+	for _, c := range cases {
+		t.Run(c.input, func(t *testing.T) {
+			matches := pgDumpVersionRegexp.FindStringSubmatch(c.input)
+			require.Len(t, matches, 3)
+			require.Equal(t, fmt.Sprintf("%d", c.expectedMajor), matches[1])
+			require.Equal(t, fmt.Sprintf("%d", c.expectedMinor), matches[2])
+		})
+	}
+}
+
+func TestPgDumpVersionSupportsRestrictKey(t *testing.T) {
+	cases := []struct {
+		name     string
+		version  *pgDumpVersion
+		expected bool
+	}{
+		{"nil version", nil, false},
+		{"PostgreSQL 15.13", &pgDumpVersion{major: 15, minor: 13}, false},
+		{"PostgreSQL 15.14", &pgDumpVersion{major: 15, minor: 14}, true},
+		{"PostgreSQL 16.0", &pgDumpVersion{major: 16, minor: 0}, false},
+		{"PostgreSQL 16.9", &pgDumpVersion{major: 16, minor: 9}, false},
+		{"PostgreSQL 16.10", &pgDumpVersion{major: 16, minor: 10}, true},
+		{"PostgreSQL 17.0", &pgDumpVersion{major: 17, minor: 0}, false},
+		{"PostgreSQL 17.5", &pgDumpVersion{major: 17, minor: 5}, false},
+		{"PostgreSQL 17.6", &pgDumpVersion{major: 17, minor: 6}, true},
+		{"PostgreSQL 17.7", &pgDumpVersion{major: 17, minor: 7}, true},
+		{"PostgreSQL 18.0", &pgDumpVersion{major: 18, minor: 0}, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			result := c.version.supportsRestrictKey()
+			require.Equal(t, c.expected, result)
+		})
+	}
 }
 
 func defaultConnString() string {
@@ -80,6 +177,9 @@ func TestConnectionString(t *testing.T) {
 		{"postgres:///foo?socket=/var/run/postgresql", "postgres://:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
 		{"postgres://bob:secret@/foo?socket=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
 		{"postgres://bob:secret@/foo?host=/var/run/postgresql", "postgres://bob:secret@:5432/foo?host=%2Fvar%2Frun%2Fpostgresql"},
+		// redshift default port is 5439, not 5432
+		{"redshift://myhost/foo", "postgres://myhost:5439/foo"},
+		{"spanner-postgres://myhost/foo", "postgres://myhost:5432/foo"},
 	}
 
 	for _, c := range cases {
@@ -149,8 +249,7 @@ func TestPostgresCreateDropDatabase(t *testing.T) {
 		defer dbutil.MustClose(db)
 
 		err = db.Ping()
-		require.Error(t, err)
-		require.Equal(t, "pq: database \"dbmate_test\" does not exist", err.Error())
+		require.ErrorContains(t, err, "pq: database \"dbmate_test\" does not exist")
 	}()
 }
 
@@ -176,9 +275,8 @@ func TestPostgresDumpSchema(t *testing.T) {
 		require.Contains(t, string(schema), "CREATE TABLE public.schema_migrations")
 		require.Contains(t, string(schema), "\n--\n"+
 			"-- PostgreSQL database dump complete\n"+
-			"--\n\n\n"+
-			"--\n"+
-			"-- Dbmate schema migrations\n"+
+			"--\n\n")
+		require.Contains(t, string(schema), "-- Dbmate schema migrations\n"+
 			"--\n\n"+
 			"INSERT INTO public.schema_migrations (version) VALUES\n"+
 			"    ('abc1'),\n"+
@@ -214,9 +312,8 @@ func TestPostgresDumpSchema(t *testing.T) {
 		require.Contains(t, string(schema), "CREATE TABLE \"camelSchema\".\"testMigrations\"")
 		require.Contains(t, string(schema), "\n--\n"+
 			"-- PostgreSQL database dump complete\n"+
-			"--\n\n\n"+
-			"--\n"+
-			"-- Dbmate schema migrations\n"+
+			"--\n\n")
+		require.Contains(t, string(schema), "-- Dbmate schema migrations\n"+
 			"--\n\n"+
 			"INSERT INTO \"camelSchema\".\"testMigrations\" (version) VALUES\n"+
 			"    ('abc1'),\n"+
@@ -251,8 +348,7 @@ func TestPostgresDatabaseExists_Error(t *testing.T) {
 	drv.databaseURL.User = url.User("invalid")
 
 	exists, err := drv.DatabaseExists()
-	require.Error(t, err)
-	require.Equal(t, "pq: password authentication failed for user \"invalid\"", err.Error())
+	require.ErrorContains(t, err, "pq: password authentication failed for user \"invalid\"")
 	require.Equal(t, false, exists)
 }
 
@@ -265,8 +361,7 @@ func TestPostgresCreateMigrationsTable(t *testing.T) {
 		// migrations table should not exist
 		count := 0
 		err := db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
-		require.Error(t, err)
-		require.Equal(t, "pq: relation \"public.schema_migrations\" does not exist", err.Error())
+		require.ErrorContains(t, err, "pq: relation \"public.schema_migrations\" does not exist")
 
 		// create table
 		err = drv.CreateMigrationsTable(db)
@@ -303,11 +398,9 @@ func TestPostgresCreateMigrationsTable(t *testing.T) {
 		// migrations table should not exist in either schema
 		count := 0
 		err = db.QueryRow("select count(*) from \"camelFoo\".\"testMigrations\"").Scan(&count)
-		require.Error(t, err)
-		require.Equal(t, "pq: relation \"camelFoo.testMigrations\" does not exist", err.Error())
+		require.ErrorContains(t, err, "pq: relation \"camelFoo.testMigrations\" does not exist")
 		err = db.QueryRow("select count(*) from public.\"testMigrations\"").Scan(&count)
-		require.Error(t, err)
-		require.Equal(t, "pq: relation \"public.testMigrations\" does not exist", err.Error())
+		require.ErrorContains(t, err, "pq: relation \"public.testMigrations\" does not exist")
 
 		// create table
 		err = drv.CreateMigrationsTable(db)
@@ -317,8 +410,7 @@ func TestPostgresCreateMigrationsTable(t *testing.T) {
 		err = db.QueryRow("select count(*) from \"camelFoo\".\"testMigrations\"").Scan(&count)
 		require.NoError(t, err)
 		err = db.QueryRow("select count(*) from public.\"testMigrations\"").Scan(&count)
-		require.Error(t, err)
-		require.Equal(t, "pq: relation \"public.testMigrations\" does not exist", err.Error())
+		require.ErrorContains(t, err, "pq: relation \"public.testMigrations\" does not exist")
 
 		// create table should be idempotent
 		err = drv.CreateMigrationsTable(db)
@@ -345,8 +437,7 @@ func TestPostgresCreateMigrationsTable(t *testing.T) {
 		// migrations table should not exist
 		count := 0
 		err = db.QueryRow("select count(*) from \"camelSchema\".\"testMigrations\"").Scan(&count)
-		require.Error(t, err)
-		require.Equal(t, "pq: relation \"camelSchema.testMigrations\" does not exist", err.Error())
+		require.ErrorContains(t, err, "pq: relation \"camelSchema.testMigrations\" does not exist")
 
 		// create table
 		err = drv.CreateMigrationsTable(db)
@@ -358,11 +449,58 @@ func TestPostgresCreateMigrationsTable(t *testing.T) {
 		// testMigrations table should not exist in foo schema because
 		// schema specified with migrations table name takes priority over search path
 		err = db.QueryRow("select count(*) from foo.\"testMigrations\"").Scan(&count)
-		require.Error(t, err)
-		require.Equal(t, "pq: relation \"foo.testMigrations\" does not exist", err.Error())
+		require.ErrorContains(t, err, "pq: relation \"foo.testMigrations\" does not exist")
 
 		// create table should be idempotent
 		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+	})
+}
+
+func TestRedshiftCreateMigrationsTable(t *testing.T) {
+	t.Run("default schema", func(t *testing.T) {
+		drv := testRedshiftDriver(t)
+		db := prepRedshiftTestDB(t, drv)
+		defer dbutil.MustClose(db)
+
+		// migrations table should not exist
+		count := 0
+		err := db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
+		require.Error(t, err, "migrations table exists when it shouldn't")
+		require.Equal(t, "pq: relation \"public.schema_migrations\" does not exist", err.Error())
+
+		// create table
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		// migrations table should exist
+		err = db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
+		require.NoError(t, err)
+
+		// create table should be idempotent
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+	})
+}
+
+func TestSpannerPostgresCreateMigrationsTable(t *testing.T) {
+	t.Run("default schema", func(t *testing.T) {
+		drv := testSpannerPostgresDriver(t)
+		db := prepTestSpannerPostgresDB(t, drv)
+		defer dbutil.MustClose(db)
+
+		// migrations table should not exist
+		count := 0
+		err := db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
+		require.Error(t, err, "migrations table exists when it shouldn't")
+		require.ErrorContains(t, err, "pq: relation \"public.schema_migrations\" does not exist")
+
+		// create table
+		err = drv.CreateMigrationsTable(db)
+		require.NoError(t, err)
+
+		// migrations table should exist
+		err = db.QueryRow("select count(*) from public.schema_migrations").Scan(&count)
 		require.NoError(t, err)
 	})
 }
@@ -457,8 +595,7 @@ func TestPostgresPing(t *testing.T) {
 	// ping invalid host should return error
 	drv.databaseURL.Host = "postgres:404"
 	err = drv.Ping()
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "connect: connection refused")
+	require.ErrorContains(t, err, "connect: connection refused")
 }
 
 func TestPostgresQuotedMigrationsTableName(t *testing.T) {

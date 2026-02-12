@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -39,6 +40,8 @@ type DB struct {
 	AutoDumpSchema bool
 	// DatabaseURL is the database connection string
 	DatabaseURL *url.URL
+	// DriverName used to force specific driver (overrides deriving from url scheme)
+	DriverName string
 	// FS specifies the filesystem, or nil for OS filesystem
 	FS fs.FS
 	// Log is the interface to write stdout
@@ -49,6 +52,8 @@ type DB struct {
 	MigrationsTableName string
 	// SchemaFile specifies the location for schema.sql file
 	SchemaFile string
+	// Fail if migrations would be applied out of order
+	Strict bool
 	// Verbose prints the result of each statement execution
 	Verbose bool
 	// WaitBefore will wait for database to become available before running any actions
@@ -75,6 +80,7 @@ func New(databaseURL *url.URL) *DB {
 		MigrationsDir:       []string{"./db/migrations"},
 		MigrationsTableName: "schema_migrations",
 		SchemaFile:          "./db/schema.sql",
+		Strict:              false,
 		Verbose:             false,
 		WaitBefore:          false,
 		WaitInterval:        time.Second,
@@ -88,9 +94,13 @@ func (db *DB) Driver() (Driver, error) {
 		return nil, ErrInvalidURL
 	}
 
-	driverFunc := drivers[db.DatabaseURL.Scheme]
+	driverName := db.DatabaseURL.Scheme
+	if db.DriverName != "" {
+		driverName = db.DriverName
+	}
+	driverFunc := drivers[driverName]
 	if driverFunc == nil {
-		return nil, fmt.Errorf("%w: %s", ErrUnsupportedDriver, db.DatabaseURL.Scheme)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedDriver, driverName)
 	}
 
 	config := DriverConfig{
@@ -218,6 +228,48 @@ func (db *DB) DumpSchema() error {
 	return os.WriteFile(db.SchemaFile, schema, 0o644)
 }
 
+// LoadSchema loads schema file to the current database
+func (db *DB) LoadSchema() error {
+	drv, err := db.Driver()
+	if err != nil {
+		return err
+	}
+
+	sqlDB, err := drv.Open()
+	if err != nil {
+		return err
+	}
+	defer dbutil.MustClose(sqlDB)
+
+	_, err = os.Stat(db.SchemaFile)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(db.Log, "Reading: %s\n", db.SchemaFile)
+
+	bytes, err := os.ReadFile(db.SchemaFile)
+	if err != nil {
+		return err
+	}
+
+	// Strip psql meta-commands (e.g., \restrict, \unrestrict) that cannot be
+	// executed directly against the database server.
+	bytes, err = dbutil.StripPsqlMetaCommands(bytes)
+	if err != nil {
+		return err
+	}
+
+	result, err := sqlDB.Exec(string(bytes))
+	if err != nil {
+		return err
+	} else if db.Verbose {
+		db.printVerbose(result)
+	}
+
+	return nil
+}
+
 // ensureDir creates a directory if it does not already exist
 func ensureDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -309,47 +361,70 @@ func (db *DB) Migrate() error {
 		return ErrNoMigrationFiles
 	}
 
+	highestAppliedMigrationVersion := ""
+	pendingMigrations := []Migration{}
+	for _, migration := range migrations {
+		if migration.Applied {
+			if db.Strict && highestAppliedMigrationVersion <= migration.Version {
+				highestAppliedMigrationVersion = migration.Version
+			}
+		} else {
+			pendingMigrations = append(pendingMigrations, migration)
+		}
+	}
+
+	if len(pendingMigrations) > 0 && db.Strict && pendingMigrations[0].Version <= highestAppliedMigrationVersion {
+		return fmt.Errorf(
+			"migration `%s` is out of order with already applied migrations, the version number has to be higher than the applied migration `%s` in --strict mode",
+			pendingMigrations[0].Version,
+			highestAppliedMigrationVersion,
+		)
+	}
+
 	sqlDB, err := db.openDatabaseForMigration(drv)
 	if err != nil {
 		return err
 	}
 	defer dbutil.MustClose(sqlDB)
 
-	for _, migration := range migrations {
-		if migration.Applied {
-			continue
-		}
-
+	for _, migration := range pendingMigrations {
 		fmt.Fprintf(db.Log, "Applying: %s\n", migration.FileName)
+
+		start := time.Now()
 
 		parsed, err := migration.Parse()
 		if err != nil {
 			return err
 		}
 
-		execMigration := func(tx dbutil.Transaction) error {
-			// run actual migration
-			result, err := tx.Exec(parsed.Up)
-			if err != nil {
-				return err
-			} else if db.Verbose {
-				db.printVerbose(result)
+		for _, migrationSection := range parsed {
+			execMigration := func(tx dbutil.Transaction) error {
+				// run actual migration
+				result, err := tx.Exec(migrationSection.Up)
+				if err != nil {
+					return drv.QueryError(migrationSection.Up, err)
+				} else if db.Verbose {
+					db.printVerbose(result)
+				}
+
+				// record migration
+				return drv.InsertMigration(tx, migration.Version)
 			}
 
-			// record migration
-			return drv.InsertMigration(tx, migration.Version)
-		}
+			if migrationSection.UpOptions.Transaction() {
+				// begin transaction
+				err = doTransaction(sqlDB, execMigration)
+			} else {
+				// run outside of transaction
+				err = execMigration(sqlDB)
+			}
 
-		if parsed.UpOptions.Transaction() {
-			// begin transaction
-			err = doTransaction(sqlDB, execMigration)
-		} else {
-			// run outside of transaction
-			err = execMigration(sqlDB)
-		}
+			elapsed := time.Since(start)
+			fmt.Fprintf(db.Log, "Applied: %s in %s\n", migration.FileName, elapsed)
 
-		if err != nil {
-			return err
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -373,7 +448,7 @@ func (db *DB) printVerbose(result sql.Result) {
 }
 
 func (db *DB) readMigrationsDir(dir string) ([]fs.DirEntry, error) {
-	path := filepath.Clean(dir)
+	path := path.Clean(dir)
 
 	// We use nil instead of os.DirFS() because DirFS cannot support both relative and absolute
 	// directory paths - it must be anchored at either "." or "/", which we do not know in advance.
@@ -433,7 +508,7 @@ func (db *DB) FindMigrations() ([]Migration, error) {
 			migration := Migration{
 				Applied:  false,
 				FileName: matches[0],
-				FilePath: filepath.Join(dir, matches[0]),
+				FilePath: path.Join(dir, matches[0]),
 				FS:       db.FS,
 				Version:  matches[1],
 			}
@@ -445,9 +520,11 @@ func (db *DB) FindMigrations() ([]Migration, error) {
 		}
 	}
 
-	sort.Slice(migrations, func(i, j int) bool {
-		return migrations[i].FileName < migrations[j].FileName
-	})
+	sort.Slice(
+		migrations, func(i, j int) bool {
+			return migrations[i].FileName < migrations[j].FileName
+		},
+	)
 
 	return migrations, nil
 }
@@ -484,39 +561,46 @@ func (db *DB) Rollback() error {
 
 	fmt.Fprintf(db.Log, "Rolling back: %s\n", latest.FileName)
 
-	parsed, err := latest.Parse()
+	start := time.Now()
+
+	parsedSections, err := latest.Parse()
 	if err != nil {
 		return err
 	}
 
-	execMigration := func(tx dbutil.Transaction) error {
-		// rollback migration
-		result, err := tx.Exec(parsed.Down)
-		if err != nil {
-			return err
-		} else if db.Verbose {
-			db.printVerbose(result)
+	for _, migrationSection := range parsedSections {
+		execMigration := func(tx dbutil.Transaction) error {
+			// rollback migration
+			result, err := tx.Exec(migrationSection.Down)
+			if err != nil {
+				return drv.QueryError(migrationSection.Down, err)
+			} else if db.Verbose {
+				db.printVerbose(result)
+			}
+
+			// remove migration record
+			return drv.DeleteMigration(tx, latest.Version)
 		}
 
-		// remove migration record
-		return drv.DeleteMigration(tx, latest.Version)
-	}
+		if migrationSection.DownOptions.Transaction() {
+			// begin transaction
+			err = doTransaction(sqlDB, execMigration)
+		} else {
+			// run outside of transaction
+			err = execMigration(sqlDB)
+		}
 
-	if parsed.DownOptions.Transaction() {
-		// begin transaction
-		err = doTransaction(sqlDB, execMigration)
-	} else {
-		// run outside of transaction
-		err = execMigration(sqlDB)
-	}
+		elapsed := time.Since(start)
+		fmt.Fprintf(db.Log, "Rolled back: %s in %s\n", latest.FileName, elapsed)
 
-	if err != nil {
-		return err
-	}
+		if err != nil {
+			return err
+		}
 
-	// automatically update schema file, silence errors
-	if db.AutoDumpSchema {
-		_ = db.DumpSchema()
+		// automatically update schema file, silence errors
+		if db.AutoDumpSchema {
+			_ = db.DumpSchema()
+		}
 	}
 
 	return nil

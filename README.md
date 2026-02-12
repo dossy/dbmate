@@ -6,7 +6,7 @@
 
 Dbmate is a database migration tool that will keep your database schema in sync across multiple developers and your production servers.
 
-It is a standalone command line tool that can be used with Go, Node.js, Python, Ruby, PHP, or any other language or framework you are using to write database-backed applications. This is especially helpful if you are writing multiple services in different languages, and want to maintain some sanity with consistent development tools.
+It is a standalone command line tool that can be used with Go, Node.js, Python, Ruby, PHP, Rust, C++, or any other language or framework you are using to write database-backed applications. This is especially helpful if you are writing multiple services in different languages, and want to maintain some sanity with consistent development tools.
 
 For a comparison between dbmate and other popular database schema migration tools, please see [Alternatives](#alternatives).
 
@@ -22,6 +22,8 @@ For a comparison between dbmate and other popular database schema migration tool
     - [MySQL](#mysql)
     - [SQLite](#sqlite)
     - [ClickHouse](#clickhouse)
+    - [BigQuery](#bigquery)
+    - [Spanner](#spanner)
   - [Creating Migrations](#creating-migrations)
   - [Running Migrations](#running-migrations)
   - [Rolling Back Migrations](#rolling-back-migrations)
@@ -40,15 +42,16 @@ For a comparison between dbmate and other popular database schema migration tool
 
 ## Features
 
-- Supports MySQL, PostgreSQL, SQLite, and ClickHouse.
-- Uses plain SQL for writing schema migrations.
-- Migrations are timestamp-versioned, to avoid version number conflicts with multiple developers.
-- Migrations are run atomically inside a transaction.
-- Supports creating and dropping databases (handy in development/test).
-- Supports saving a `schema.sql` file to easily diff schema changes in git.
-- Database connection URL is defined using an environment variable (`DATABASE_URL` by default), or specified on the command line.
-- Built-in support for reading environment variables from your `.env` file.
-- Easy to distribute, single self-contained binary.
+- Supports MySQL, PostgreSQL, SQLite, and ClickHouse
+- Uses plain SQL for writing schema migrations
+- Migrations are timestamp-versioned, to avoid version number conflicts with multiple developers
+- Migrations are run atomically inside a transaction
+- Supports creating and dropping databases (handy in development/test)
+- Supports saving a `schema.sql` file to easily diff schema changes in git
+- Database connection URL is defined using an environment variable (`DATABASE_URL` by default), or specified on the command line
+- Built-in support for reading environment variables from your `.env` file
+- Easy to distribute, single self-contained binary
+- Doesn't try to upsell you on a SaaS service
 
 ## Installation
 
@@ -57,8 +60,8 @@ For a comparison between dbmate and other popular database schema migration tool
 Install using [NPM](https://www.npmjs.com/):
 
 ```sh
-$ npm install --save-dev dbmate
-$ npx dbmate --help
+npm install --save-dev dbmate
+npx dbmate --help
 ```
 
 **macOS**
@@ -66,7 +69,8 @@ $ npx dbmate --help
 Install using [Homebrew](https://brew.sh/):
 
 ```sh
-$ brew install dbmate
+brew install dbmate
+dbmate --help
 ```
 
 **Linux**
@@ -74,8 +78,9 @@ $ brew install dbmate
 Install the binary directly:
 
 ```sh
-$ sudo curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
-$ sudo chmod +x /usr/local/bin/dbmate
+sudo curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
+sudo chmod +x /usr/local/bin/dbmate
+/usr/local/bin/dbmate --help
 ```
 
 **Windows**
@@ -84,36 +89,23 @@ Install using [Scoop](https://scoop.sh)
 
 ```pwsh
 scoop install dbmate
+dbmate --help
 ```
 
 **Docker**
 
-Docker images are published to both Docker Hub ([`amacneil/dbmate`](https://hub.docker.com/r/amacneil/dbmate)) and Github Container Registry ([`ghcr.io/amacneil/dbmate`](https://ghcr.io/amacneil/dbmate)).
+Docker images are published to GitHub Container Registry ([`ghcr.io/amacneil/dbmate`](https://ghcr.io/amacneil/dbmate)).
 
 Remember to set `--network=host` or see [this comment](https://github.com/amacneil/dbmate/issues/128#issuecomment-615924611) for more tips on using dbmate with docker networking):
 
 ```sh
-$ docker run --rm -it --network=host ghcr.io/amacneil/dbmate --help
+docker run --rm -it --network=host ghcr.io/amacneil/dbmate --help
 ```
 
 If you wish to create or apply migrations, you will need to use Docker's [bind mount](https://docs.docker.com/storage/bind-mounts/) feature to make your local working directory (`pwd`) available inside the dbmate container:
 
 ```sh
-$ docker run --rm -it --network=host -v "$(pwd)/db:/db" ghcr.io/amacneil/dbmate new create_users_table
-```
-
-**Heroku**
-
-To use dbmate on Heroku, either use the NPM method, or store the linux binary in your git repository:
-
-```sh
-$ mkdir -p bin
-$ curl -fsSL -o bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
-$ chmod +x bin/dbmate
-$ git add bin/dbmate
-$ git commit -m "Add dbmate binary"
-$ git push heroku master
-$ heroku run bin/dbmate --help
+docker run --rm -it --network=host -v "$(pwd)/db:/db" ghcr.io/amacneil/dbmate new create_users_table
 ```
 
 ## Commands
@@ -129,6 +121,7 @@ dbmate rollback  # roll back the most recent migration
 dbmate down      # alias for rollback
 dbmate status    # show the status of all migrations (supports --exit-code and --quiet)
 dbmate dump      # write the database schema.sql file
+dbmate load      # load schema.sql file to the database
 dbmate wait      # wait for the database server to become available
 ```
 
@@ -137,11 +130,14 @@ dbmate wait      # wait for the database server to become available
 The following options are available with all commands. You must use command line arguments in the order `dbmate [global options] command [command options]`. Most options can also be configured via environment variables (and loaded from your `.env` file, which is helpful to share configuration between team members).
 
 - `--url, -u "protocol://host:port/dbname"` - specify the database url directly. _(env: `DATABASE_URL`)_
+- `--driver "driver_name"` - specify the driver to use (if empty, the driver is derived from database URL scheme). _(env: `DBMATE_DRIVER`)_
 - `--env, -e "DATABASE_URL"` - specify an environment variable to read the database connection URL from.
+- `--env-file ".env"` - specify an alternate environment variables file(s) to load.
 - `--migrations-dir, -d "./db/migrations"` - where to keep the migration files. _(env: `DBMATE_MIGRATIONS_DIR`)_
 - `--migrations-table "schema_migrations"` - database table to record migrations in. _(env: `DBMATE_MIGRATIONS_TABLE`)_
 - `--schema-file, -s "./db/schema.sql"` - a path to keep the schema.sql file. _(env: `DBMATE_SCHEMA_FILE`)_
 - `--no-dump-schema` - don't auto-update the schema.sql file on migrate/rollback _(env: `DBMATE_NO_DUMP_SCHEMA`)_
+- `--strict` - fail if migrations would be applied out of order _(env: `DBMATE_STRICT`)_
 - `--wait` - wait for the db to become available before executing the subsequent command _(env: `DBMATE_WAIT`)_
 - `--wait-timeout 60s` - timeout for --wait flag _(env: `DBMATE_WAIT_TIMEOUT`)_
 
@@ -167,6 +163,7 @@ protocol://username:password@host:port/database_name?options
 ```
 
 - `protocol` must be one of `mysql`, `postgres`, `postgresql`, `sqlite`, `sqlite3`, `clickhouse`
+- `username` and `password` must be URL encoded (you will get an error if you use special charactors)
 - `host` can be either a hostname or IP address
 - `options` are driver-specific (refer to the underlying Go SQL drivers if you wish to use these)
 
@@ -186,6 +183,7 @@ Dropping: myapp_test
 $ dbmate -e TEST_DATABASE_URL --no-dump-schema up
 Creating: myapp_test
 Applying: 20151127184807_create_users_table.sql
+Applied: 20151127184807_create_users_table.sql in 123µs
 ```
 
 Alternatively, you can specify the url directly on the command line:
@@ -260,15 +258,57 @@ To specify an absolute path, add a forward slash to the path. The following will
 DATABASE_URL="sqlite:/tmp/database.sqlite3"
 ```
 
+Note that for some common [settings](https://sqlite.org/pragma.html) like `journal_mode` to improve performance, transactions need to be disabled for that migration file, e.g.
+
+```sql
+-- migrate:up transaction:false
+PRAGMA journal_mode = WAL;
+```
+
+Otherwise the migration will fail with "Error: cannot change into wal mode from within a transaction".
+
 #### ClickHouse
+
+Dbmate supports connecting to ClickHouse using native TCP (default) or HTTP/HTTPS.
+
+##### Native (TCP)
+
+By default, the `clickhouse://` scheme uses the native protocol on port `9000`.
 
 ```sh
 DATABASE_URL="clickhouse://username:password@127.0.0.1:9000/database_name"
 ```
 
+##### HTTP / HTTPS
+
+You can use `clickhouse+http://` (deafult port 8123) or `clickhouse+https://` (default port 8443).
+
+```sh
+# HTTP (Defaults to port 8123)
+DATABASE_URL="clickhouse+http://username:password@127.0.0.1:8123/database_name"
+
+# HTTPS (Defaults to port 8443)
+DATABASE_URL="clickhouse+https://username:password@127.0.0.1:8443/database_name"
+```
+
+##### Using the --driver flag
+
+You can use the ClickHouse driver with a standard http/https/tcp URL by providing the --driver flag
+
+```sh
+# Connect via HTTP using generic URL syntax
+dbmate --driver clickhouse --url "http://username:password@127.0.0.1:8123/database_name" status
+
+dbmate --driver clickhouse --url "https://username:password@127.0.0.1:8443/database_name" status
+
+# Better to rely on the standard clickhouse:// scheme, but this is supported
+dbmate --driver clickhouse --url "tcp://username:password@127.0.0.1:9000/database_name" status
+```
+
 To work with ClickHouse cluster, there are 4 connection query parameters that can be supplied:
 
 - `on_cluster` - Indicataion to use cluster statements and replicated migration table. (default: `false`) If this parameter is not supplied, other cluster related query parameters are ignored.
+
 ```sh
 DATABASE_URL="clickhouse://username:password@127.0.0.1:9000/database_name?on_cluster"
 
@@ -295,6 +335,56 @@ DATABASE_URL="clickhouse://username:password@127.0.0.1:9000/database_name?on_clu
 
 [See other supported connection options](https://github.com/ClickHouse/clickhouse-go#dsn).
 
+#### BigQuery
+
+Follow the following format for `DATABASE_URL` when connecting to actual BigQuery in GCP:
+
+```
+bigquery://projectid/location/dataset
+```
+
+`projectid` (mandatory) - Project ID
+
+`dataset` (mandatory) - Dataset name within the Project
+
+`location` (optional) - Where Dataset is created
+
+_NOTE: Follow [this doc](https://cloud.google.com/docs/authentication/provide-credentials-adc) on how to set `GOOGLE_APPLICATION_CREDENTIALS` environment variable for proper Authentication_
+
+Follow the following format if trying to connect to a custom endpoint e.g. [BigQuery Emulator](https://github.com/goccy/bigquery-emulator)
+
+```
+bigquery://host:port/projectid/location/dataset?disable_auth=true
+```
+
+`disable_auth` (optional) - Pass `true` to skip Authentication, use only for testing and connecting to emulator.
+
+#### Spanner
+
+Spanner support is currently limited to databases using the [PostgreSQL Dialect](https://cloud.google.com/spanner/docs/postgresql-interface), which must be chosen during database creation. For future Spanner with GoogleSQL support, see [this discussion](https://github.com/amacneil/dbmate/discussions/369).
+
+Spanner with the Postgres interface requires that the [PGAdapter](https://cloud.google.com/spanner/docs/pgadapter) is running. Use the following format for `DATABASE_URL`, with the host and port set to where the PGAdapter is running:
+
+```shell
+DATABASE_URL="spanner-postgres://127.0.0.1:5432/database_name?sslmode=disable"
+```
+
+Note that specifying a username and password is not necessary, as authentication is handled by the PGAdapter (they will be ignored by the PGAdapter if specified).
+
+Other options of the [postgres driver](#postgresql) are supported.
+
+Spanner also doesn't allow DDL to be executed inside explicit transactions. You must therefore specify `transaction:false` on migrations that include DDL:
+
+```sql
+-- migrate:up transaction:false
+CREATE TABLE ...
+
+-- migrate:down transaction:false
+DROP TABLE ...
+```
+
+Schema dumps are not currently supported, as `pg_dump` uses functions that are not provided by Spanner.
+
 ### Creating Migrations
 
 To create a new migration, run `dbmate new create_users_table`. You can name the migration anything you like. This will create a file `db/migrations/20151127184807_create_users_table.sql` in the current directory:
@@ -318,6 +408,22 @@ create table users (
 -- migrate:down
 ```
 
+For related changes, it is possible to include multiple migrations in a single file using additional `migrate:up` and `migrate:down` sections. Migration file either succeeds or fails as a whole.
+
+```sql
+-- migrate:up
+CREATE TABLE users (id SERIAL PRIMARY KEY);
+
+-- migrate:down
+DROP TABLE users;
+
+-- migrate:up
+ALTER TABLE users ADD COLUMN email VARCHAR;
+
+-- migrate:down
+ALTER TABLE users DROP COLUMN email;
+```
+
 > Note: Migration files are named in the format `[version]_[description].sql`. Only the version (defined as all leading numeric characters in the file name) is recorded in the database, so you can safely rename a migration file without having any effect on its current application state.
 
 ### Running Migrations
@@ -328,6 +434,7 @@ Run `dbmate up` to run any pending migrations.
 $ dbmate up
 Creating: myapp_development
 Applying: 20151127184807_create_users_table.sql
+Applied: 20151127184807_create_users_table.sql in 123µs
 Writing: ./db/schema.sql
 ```
 
@@ -356,6 +463,7 @@ Run `dbmate rollback` to roll back the most recent migration:
 ```sh
 $ dbmate rollback
 Rolling back: 20151127184807_create_users_table.sql
+Rolled back: 20151127184807_create_users_table.sql in 123µs
 Writing: ./db/schema.sql
 ```
 
@@ -367,7 +475,7 @@ dbmate supports options passed to a migration block in the form of `key:value` p
 
 **transaction**
 
-`transaction` is useful if you need to run some SQL which cannot be executed from within a transaction. For example, in Postgres, you would need to disable transactions for migrations that alter an enum type to add a value:
+`transaction` is useful if you do not want to run SQL inside a transaction:
 
 ```sql
 -- migrate:up transaction:false
@@ -419,7 +527,7 @@ When you run the `up`, `migrate`, or `rollback` commands, dbmate will automatica
 
 It is recommended to check this file into source control, so that you can easily review changes to the schema in commits or pull requests. It's also possible to use this file when you want to quickly load a database schema, without running each migration sequentially (for example in your test harness). However, if you do not wish to save this file, you could add it to your `.gitignore`, or pass the `--no-dump-schema` command line option.
 
-To dump the `schema.sql` file without performing any other actions, run `dbmate dump`. Unlike other dbmate actions, this command relies on the respective `pg_dump`, `mysqldump`, or `sqlite3` commands being available in your PATH. If these tools are not available, dbmate will silenty skip the schema dump step during `up`, `migrate`, or `rollback` actions. You can diagnose the issue by running `dbmate dump` and looking at the output:
+To dump the `schema.sql` file without performing any other actions, run `dbmate dump`. Unlike other dbmate actions, this command relies on the respective `pg_dump`, `mysqldump`, or `sqlite3` commands being available in your PATH. If these tools are not available, dbmate will silently skip the schema dump step during `up`, `migrate`, or `rollback` actions. You can diagnose the issue by running `dbmate dump` and looking at the output:
 
 ```sh
 $ dbmate dump
@@ -561,7 +669,7 @@ Why another database schema migration tool? Dbmate was inspired by many other to
 | Ability to wait for database to become ready                 |              :white_check_mark:              |                                           |                                                      |                                                             |                                                                             |                                                                          |                                 |
 | Database connection string loaded from environment variables |              :white_check_mark:              |                                           |                                                      |                                                             |                                                                             |                                                                          |       :white_check_mark:        |
 | Automatically load .env file                                 |              :white_check_mark:              |                                           |                                                      |                                                             |                                                                             |                                                                          |                                 |
-| No separate configuration file                               |              :white_check_mark:              |              :white_check_mark:           |                                                      |                     :white_check_mark:                      |                             :white_check_mark:                              |                            :white_check_mark:                            |                                 |
+| No separate configuration file                               |              :white_check_mark:              |            :white_check_mark:             |                                                      |                     :white_check_mark:                      |                             :white_check_mark:                              |                            :white_check_mark:                            |                                 |
 | Language/framework independent                               |              :white_check_mark:              |            :white_check_mark:             |                                                      |                     :white_check_mark:                      |                                                                             |                                                                          |       :white_check_mark:        |      :white_check_mark:       |
 | **Drivers**                                                  |
 | PostgreSQL                                                   |              :white_check_mark:              |            :white_check_mark:             |                  :white_check_mark:                  |                     :white_check_mark:                      |                             :white_check_mark:                              |                            :white_check_mark:                            |       :white_check_mark:        |      :white_check_mark:       |
@@ -575,7 +683,7 @@ _If you notice any inaccuracies in this table, please [propose a change](https:/
 
 Dbmate is written in Go, pull requests are welcome.
 
-Tests are run against a real database using docker-compose. To build a docker image and run the tests:
+Tests are run against a real database using docker compose. To build a docker image and run the tests:
 
 ```sh
 $ make docker-all
